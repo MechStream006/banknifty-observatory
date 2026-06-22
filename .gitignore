@@ -1,0 +1,87 @@
+# ── Secrets and credentials ───────────────────────────────────────────────────
+# These must NEVER be committed under any circumstances.
+.env
+*.env
+.env.*
+!.env.example
+secrets/
+credentials.json
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.asc
+*.gpg
+token*.json
+auth_response.json
+
+# ── Data payloads ──────────────────────────────────────────────────────────────
+# Raw market data and smoke test outputs are never stored in the repository.
+# Manifests and checksums are tracked; payloads are not.
+data/
+backups/
+buffer/
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+*.arrow
+*.csv
+*.jsonl
+*.ndjson
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+log/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+*.dylib
+*.pyd
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ── Test and coverage artifacts ───────────────────────────────────────────────
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.prof
+
+# ── IDE and OS ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Jupyter (blocked — research notebooks belong in versioned methodology docs)
+*.ipynb
+.ipynb_checkpoints/
+
+# ── Temporary and generated ───────────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+tmp/
+temp/
