@@ -1,0 +1,74 @@
+# BankNifty Observatory — Discovery Phase 1 Service
+#
+# Runs scripts/discovery_run.py once per trading day.
+# The process exits naturally at 15:30 IST when PollScheduler.ticks() is exhausted.
+# systemd restarts it only on non-zero exit (crash or phase abort).
+#
+# Weekly maintenance:
+#   Update BNO_EXPIRY in /etc/banknifty-observatory/discovery.env
+#   each Thursday evening for the following week's expiry.
+#
+# Installation:
+#   sudo cp ops/systemd/banknifty-observatory.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable banknifty-observatory
+#   # Then either start manually or use the companion .timer (see ops/systemd/README.md)
+#
+# Logs:
+#   journalctl -u banknifty-observatory -f
+#   data/phase1/logs/bno.log  (structured JSON, rotated daily)
+
+[Unit]
+Description=BankNifty Observatory Discovery Phase 1
+Documentation=file:///home/bno/banknifty-observatory/ops/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bno
+Group=bno
+
+# Project root — .env and lib/ must be accessible from here.
+WorkingDirectory=/home/bno/banknifty-observatory
+
+# Credentials come from .env in WorkingDirectory.
+# BNO_EXPIRY and BNO_PHASE are set in the EnvironmentFile and rotated weekly.
+EnvironmentFile=/etc/banknifty-observatory/discovery.env
+Environment=PYTHONPATH=/home/bno/banknifty-observatory
+
+ExecStart=/home/bno/.venv/bin/python scripts/discovery_run.py \
+    --phase ${BNO_PHASE} \
+    --expiry ${BNO_EXPIRY}
+
+# Market session is at most ~6h 15m = 22500 seconds.
+# A natural exit (exit 0) is NOT restarted — the scheduler stops at 15:30 IST.
+# A crash exit (exit 1) is restarted after 60 seconds.
+Restart=on-failure
+RestartSec=60
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# Allow up to 30 seconds for the controller to finish the current tick on SIGTERM.
+# The SIGTERM handler in discovery_run.py raises KeyboardInterrupt, which causes
+# the controller to complete the in-progress tick before shutting down.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Prevent the service from writing outside the project data directory.
+# Adjust ProtectSystem and ReadWritePaths to match actual data_dir.
+ProtectSystem=strict
+ReadWritePaths=/home/bno/banknifty-observatory/data
+ReadWritePaths=/home/bno/banknifty-observatory/logs
+
+# Resource limits
+LimitNOFILE=4096
+MemoryMax=512M
+
+# Stdout/stderr go to the journal; structured JSON logs also go to data/phase1/logs/.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=banknifty-observatory
+
+[Install]
+WantedBy=multi-user.target

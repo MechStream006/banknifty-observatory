@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "banknifty-observatory"
+version = "0.1.0"
+description = "BankNifty Market Observatory — Research Platform"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = [
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "smartapi-python>=1.5.5",   # market data API client (read-only; no order placement)
+    "pyotp>=2.8",               # TOTP code generation for session authentication
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.3",
+    "mypy>=1.8",
+]
+# Install when database integration is implemented:
+#   pip install "banknifty-observatory[db]"
+db = [
+    "psycopg2-binary>=2.9",     # PostgreSQL driver (lib/db/ — not yet implemented)
+    "alembic>=1.13",            # schema migration tool (migrations/ — not yet implemented)
+]
+
+[tool.setuptools.packages.find]
+# future/ is sealed; exclude it from the installed package
+exclude = ["future*", "tests*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+# Sealed future modules are excluded from type-checking
+exclude = ["^future/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short -q"

@@ -1,0 +1,37 @@
+# BankNifty Observatory — Discovery Phase 1 Timer
+#
+# Starts the discovery service automatically at 09:10 IST (03:40 UTC)
+# on trading days (Monday–Friday).
+#
+# The 09:10 start gives 5 minutes before market open at 09:15 to:
+#   - Authenticate and obtain a session token
+#   - Pre-warm the token cache
+#   - Validate connectivity
+#
+# The service exits naturally when PollScheduler reaches 15:30 IST.
+# systemd does not restart a clean exit — the timer handles the next-day start.
+#
+# Installation:
+#   sudo cp deployment/systemd/banknifty-observatory.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now banknifty-observatory.timer
+#
+# Status:
+#   systemctl list-timers banknifty-observatory.timer
+#   systemctl status banknifty-observatory.timer
+
+[Unit]
+Description=BankNifty Observatory Daily Start Timer
+Documentation=file:///home/bno/banknifty-observatory/deployment/server_setup.md
+
+[Timer]
+# 09:10 IST = 03:40 UTC. Adjust if the server is in IST timezone (then use 09:10:00).
+OnCalendar=Mon..Fri 03:40:00 UTC
+Persistent=true
+# Persistent=true: if the server was down at 03:40 UTC, start as soon as it comes up
+# (within the same day). Prevents silent gaps due to server restarts or maintenance.
+
+Unit=banknifty-observatory.service
+
+[Install]
+WantedBy=timers.target

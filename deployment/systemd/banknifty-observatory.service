@@ -1,0 +1,71 @@
+# BankNifty Observatory — Discovery Phase 1 Service
+#
+# Runs scripts/discovery_run.py once per trading day.
+# Expiries are configured via BNO_CHAIN_EXPIRIES in the EnvironmentFile.
+# The process exits naturally at 15:30 IST when PollScheduler.ticks() is exhausted.
+# systemd restarts it only on non-zero exit (crash or phase abort).
+#
+# Weekly maintenance:
+#   Update BNO_CHAIN_EXPIRIES in /etc/banknifty-observatory/discovery.env
+#   each Thursday evening for the following week's active expiries.
+#
+# Installation:
+#   sudo cp deployment/systemd/banknifty-observatory.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable banknifty-observatory
+#
+# Start options:
+#   Manual:  sudo systemctl start banknifty-observatory
+#   Timer:   sudo cp deployment/systemd/banknifty-observatory.timer /etc/systemd/system/
+#            sudo systemctl enable --now banknifty-observatory.timer
+#
+# Logs:
+#   journalctl -u banknifty-observatory -f
+#   /srv/bno/data/phase1/logs/  (structured JSON, created at session start)
+
+[Unit]
+Description=BankNifty Observatory Discovery Phase 1
+Documentation=file:///home/bno/banknifty-observatory/deployment/server_setup.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bno
+Group=bno
+
+WorkingDirectory=/home/bno/banknifty-observatory
+
+# All credentials and configuration from a root-owned, 600-permission file.
+# Never put secrets in this unit file.
+EnvironmentFile=/etc/banknifty-observatory/discovery.env
+Environment=PYTHONPATH=/home/bno/banknifty-observatory
+
+ExecStart=/home/bno/.venv/bin/python scripts/discovery_run.py --phase 1
+
+# A natural exit at market close (exit 0) is NOT restarted.
+# A crash exit (exit 1) is restarted after 60 seconds, up to 3 times per 5 minutes.
+Restart=on-failure
+RestartSec=60
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# Allow up to 30 seconds for the controller to finish the current tick on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Confine writes to the project data directories.
+ProtectSystem=strict
+ReadWritePaths=/srv/bno/data
+ReadWritePaths=/home/bno/banknifty-observatory/logs
+
+# Resource limits appropriate for a dedicated lightweight VPS.
+LimitNOFILE=4096
+MemoryMax=512M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=banknifty-observatory
+
+[Install]
+WantedBy=multi-user.target

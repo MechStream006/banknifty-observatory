@@ -1,0 +1,26 @@
+# BankNifty Observatory — Instrument Scope Definition
+#
+# Copy to instrument_scope.yml for deployment.
+# Defines which instruments, strikes, and expiries are actively collected.
+# Changes to this file affect data completeness baselines — update DECISION_LOG if scope changes.
+
+instrument:
+  symbol: BANKNIFTY
+  exchange: NSE
+
+expiry_scope:
+  # How many weekly expiries to collect option chain data for
+  weekly_expiries_forward: 3
+  # How many monthly expiries to collect option chain data for
+  monthly_expiries_forward: 2
+
+strike_scope:
+  # Number of strikes above and below ATM to collect on each side
+  atm_strikes_each_side: 20
+  # Collect deep OTM strikes beyond atm_strikes_each_side (for term structure)
+  include_deep_otm: true
+  deep_otm_strikes_each_side: 10
+
+depth_scope:
+  # Order book depth levels to capture per strike
+  bid_ask_levels: 5
