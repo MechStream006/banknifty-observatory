@@ -41,6 +41,12 @@ WorkingDirectory=/home/bno/banknifty-observatory
 EnvironmentFile=/etc/banknifty-observatory/discovery.env
 Environment=PYTHONPATH=/home/bno/banknifty-observatory
 
+# Pre-flight checks run before ExecStart. Both must pass or the session is aborted.
+# 1. Disk space: require at least 2 GB free on the data directory.
+ExecStartPre=/home/bno/banknifty-observatory/scripts/check_disk_space.sh
+# 2. Expiry validation: all BNO_CHAIN_EXPIRIES must parse and be in the future.
+ExecStartPre=/home/bno/banknifty-observatory/scripts/validate_expiries.sh
+
 ExecStart=/home/bno/.venv/bin/python scripts/discovery_run.py --phase 1
 
 # A natural exit at market close (exit 0) is NOT restarted.
@@ -54,10 +60,9 @@ StartLimitBurst=3
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
-# Confine writes to the project data directories.
+# Confine writes to the data directory only.
 ProtectSystem=strict
 ReadWritePaths=/srv/bno/data
-ReadWritePaths=/home/bno/banknifty-observatory/logs
 
 # Resource limits appropriate for a dedicated lightweight VPS.
 LimitNOFILE=4096

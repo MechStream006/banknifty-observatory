@@ -26,6 +26,23 @@ sudo apt install -y \
 python3.11 --version
 ```
 
+**NTP — verify clock sync before anything else.**
+TOTP codes are valid for 30-second windows. Clock drift over ~15 seconds causes every
+generated code to be rejected, breaking authentication silently at session start.
+Ubuntu 22.04 ships `systemd-timesyncd` but it may not be active on all VPS images.
+
+```bash
+# Check current sync state
+timedatectl status
+# Required: "System clock synchronized: yes"
+# Required: "NTP service: active"
+
+# If NTP service is inactive:
+sudo systemctl enable --now systemd-timesyncd
+timedatectl timesync-status
+# Expected: a "Last successful sync:" timestamp within the last few minutes
+```
+
 ---
 
 ## 2. Create the application user

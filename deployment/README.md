@@ -8,7 +8,8 @@ This directory contains all assets needed to deploy BankNifty Observatory on a L
 
 | Task | Document |
 |---|---|
-| First-time server setup | [server_setup.md](server_setup.md) |
+| Production deployment checklist | [production_checklist.md](production_checklist.md) |
+| First-time server setup (narrative) | [server_setup.md](server_setup.md) |
 | Production environment config | [env.example](env.example) |
 | systemd service unit | [systemd/banknifty-observatory.service](systemd/banknifty-observatory.service) |
 | systemd timer (daily auto-start) | [systemd/banknifty-observatory.timer](systemd/banknifty-observatory.timer) |
