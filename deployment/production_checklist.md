@@ -312,7 +312,7 @@ Do not skip verification steps — they catch configuration errors before the ma
   |---|---|
   | `BNO_ENV` | `production` |
   | `BNO_CONFIG_SCHEMA_VERSION` | `2` |
-  | `BNO_SMARTAPI_TOTP_PROVIDER` | `authenticator_app` |
+  | `BNO_SMARTAPI_TOTP_PROVIDER` | `local_seed` |
   | `BNO_DATA_DIR` | `/srv/bno/data` |
   | `BNO_STRATEGY_ACTIVE` | `false` |
 
@@ -694,19 +694,30 @@ sudo systemctl start banknifty-observatory
 ```bash
 # Symptom: SessionAcquireError in logs, Auth FAIL in smoke test
 
-# Verify the TOTP provider setting
+# Verify the TOTP provider and secret are set
 grep BNO_SMARTAPI_TOTP_PROVIDER /etc/banknifty-observatory/discovery.env
-# production requires: authenticator_app  (not local_seed)
+# Required: local_seed
 
-# If using local_seed in development, verify the TOTP secret is correct:
+grep -c BNO_SMARTAPI_TOTP_SECRET /etc/banknifty-observatory/discovery.env
+# Expected: 1 (must be set and non-empty)
+
+# Verify the TOTP seed generates the correct code (cross-check against
+# your authenticator app — both should show the same 6-digit code):
 sudo -u bno bash -c '
+    TOTP_SECRET=$(grep BNO_SMARTAPI_TOTP_SECRET \
+        /etc/banknifty-observatory/discovery.env | cut -d= -f2)
     /home/bno/.venv/bin/python -c "
-import pyotp, os
-secret = \"YOUR_TOTP_SECRET\"
-print(pyotp.TOTP(secret).now())
-"
+import pyotp, sys
+secret = sys.argv[1]
+print(\"Current TOTP code:\", pyotp.TOTP(secret).now())
+" "$TOTP_SECRET"
 '
-# Cross-check the 6-digit code against your authenticator app
+# If the code does not match your authenticator app, the seed is wrong.
+# Retrieve the correct base32 seed from AngelOne and update discovery.env.
+
+# Also verify clock sync — TOTP codes expire every 30 seconds:
+timedatectl status | grep "System clock synchronized"
+# Required: yes
 ```
 
 ### 12.3 Disk pressure

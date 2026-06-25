@@ -195,15 +195,6 @@ class BNOSettings(BaseSettings):
     # ── Model validators (cross-field rules) ──────────────────────────────────
 
     @model_validator(mode="after")
-    def _validate_production_totp_provider(self) -> "BNOSettings":
-        if self.env == "production" and self.smartapi_totp_provider == "local_seed":
-            raise BNOConfigValidationError(
-                "BNO_SMARTAPI_TOTP_PROVIDER=local_seed is not permitted in production. "
-                "Use 'authenticator_app' or 'secrets_manager'."
-            )
-        return self
-
-    @model_validator(mode="after")
     def _validate_totp_secret_for_local_seed(self) -> "BNOSettings":
         if (
             self.smartapi_totp_provider == "local_seed"

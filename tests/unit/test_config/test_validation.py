@@ -149,14 +149,17 @@ class TestEnvironmentValidation:
 class TestCrossFieldRules:
     """Governance-level cross-field validations."""
 
-    def test_production_rejects_local_seed_totp(
+    def test_production_allows_local_seed_totp(
         self, minimal_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # local_seed is the only implemented TOTP provider. Production must
+        # accept it; blocking it while secrets_manager is unimplemented would
+        # make the service undeployable.
         monkeypatch.setenv("BNO_ENV", "production")
         monkeypatch.setenv("BNO_SMARTAPI_TOTP_PROVIDER", "local_seed")
-        with pytest.raises(BNOConfigValidationError) as exc_info:
-            load_settings(env_file=None)
-        assert "local_seed" in str(exc_info.value)
+        settings = load_settings(env_file=None)
+        assert settings.env == "production"
+        assert settings.smartapi_totp_provider == "local_seed"
 
     def test_local_seed_without_totp_secret_raises(
         self, minimal_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
