@@ -226,9 +226,9 @@ class TestHorizonGridParsing:
 class TestChainExpiriesValidation:
     """BNO_CHAIN_EXPIRIES parsing, normalisation, and format validation.
 
-    pydantic-settings 2.x decodes list[str] fields as JSON arrays.
-    Set BNO_CHAIN_EXPIRIES as a JSON array in env vars, e.g.:
-        BNO_CHAIN_EXPIRIES=["26JUN2026","30JUN2026"]
+    Both formats are accepted:
+        BNO_CHAIN_EXPIRIES=26JUN2026,30JUN2026         (documented CSV format)
+        BNO_CHAIN_EXPIRIES=["26JUN2026","30JUN2026"]   (JSON array, also valid)
     """
 
     def test_single_expiry_parses_to_list(
@@ -301,14 +301,12 @@ class TestChainExpiriesValidation:
         settings = load_settings(env_file=None)
         assert len(settings.chain_expiries) == 12
 
-    def test_non_json_value_raises_type_error(
+    def test_csv_format_parses_correctly(
         self, minimal_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A plain string (not a JSON array) fails pydantic-settings decoding.
-        monkeypatch.setenv("BNO_CHAIN_EXPIRIES", "26JUN2026")
-        with pytest.raises(BNOConfigTypeError) as exc_info:
-            load_settings(env_file=None)
-        assert "CHAIN_EXPIRIES" in exc_info.value.key
+        monkeypatch.setenv("BNO_CHAIN_EXPIRIES", "26JUN2026,30JUN2026")
+        settings = load_settings(env_file=None)
+        assert settings.chain_expiries == ["26JUN2026", "30JUN2026"]
 
     def test_empty_json_array_raises_validation_error(
         self, minimal_env: dict[str, str], monkeypatch: pytest.MonkeyPatch

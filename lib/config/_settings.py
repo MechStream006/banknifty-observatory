@@ -98,6 +98,38 @@ class BNOSettings(BaseSettings):
     strategy_active: bool = False
     labeling_active: bool = False
 
+    # ── Source customisation ──────────────────────────────────────────────────
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: object,
+        env_settings: object,
+        dotenv_settings: object,
+        file_secret_settings: object,
+    ) -> tuple[object, ...]:
+        # Patch both env sources so that CSV-format values (e.g.
+        # BNO_CHAIN_EXPIRIES=26JUN2026,30JUN2026) fall back to the raw string
+        # when json.loads() fails, letting mode="before" validators handle them.
+        # JSON-array syntax (["26JUN2026","30JUN2026"]) still works unchanged.
+        import json as _json
+        import types as _types
+
+        def _decode_csv_fallback(
+            self: object, field_name: str, field: object, value: object
+        ) -> object:
+            try:
+                return _json.loads(value)  # type: ignore[arg-type]
+            except (ValueError, TypeError):
+                return value
+
+        for src in (env_settings, dotenv_settings):
+            src.decode_complex_value = _types.MethodType(  # type: ignore[attr-defined]
+                _decode_csv_fallback, src
+            )
+        return init_settings, env_settings, dotenv_settings, file_secret_settings
+
     # ── Field validators ──────────────────────────────────────────────────────
 
     @field_validator("chain_expiries", mode="before")

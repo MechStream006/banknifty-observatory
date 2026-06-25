@@ -18,7 +18,7 @@ _MINIMAL_VALID_ENV: dict[str, str] = {
     "BNO_TELEGRAM_BOT_TOKEN": "test_telegram_token_value",
     "BNO_TELEGRAM_CHAT_ID": "-100123456789",
     "BNO_S3_BUCKET": "test-bno-bucket",
-    "BNO_CHAIN_EXPIRIES": '["26JUN2026","30JUN2026"]',
+    "BNO_CHAIN_EXPIRIES": "26JUN2026,30JUN2026",
 }
 
 
