@@ -56,6 +56,7 @@ from lib.discovery.controller import DiscoveryController
 from lib.discovery.fetchers.chain import ChainFetcher
 from lib.discovery.fetchers.spot import SpotFetcher
 from lib.discovery.fetchers.vix import VIXFetcher
+from lib.discovery.instrument_registry import InstrumentRegistry
 from lib.discovery.manifest import RunManifest, resolve_git_commit, write_manifest
 from lib.discovery.scheduler import PollScheduler
 from lib.discovery.session import SmartAPISession
@@ -298,6 +299,11 @@ def main() -> int:  # noqa: C901
 
     # ── Step 6: Assemble components ─────────────────────────────────────────────
     session      = SmartAPISession(settings)
+    # One InstrumentRegistry per run, shared by every expiry's ChainFetcher via
+    # the controller's startup wiring (registry.build() once, then injected into
+    # each chain_fetchers entry) — replaces the old per-tick, per-expiry
+    # searchScrip() calls with a single searchScrip() call for the whole run.
+    registry     = InstrumentRegistry(underlying="BANKNIFTY")
     chain_fetchers = [
         ChainFetcher(
             expiry=exp,
@@ -324,6 +330,7 @@ def main() -> int:  # noqa: C901
         archiver=archiver,
         store=None,  # SQLiteAnalysisStore not yet implemented
         run_id=run_uid,
+        registry=registry,
     )
 
     # ── Step 6b: Write the "running" manifest before the poll loop ──────────────

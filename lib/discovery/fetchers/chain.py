@@ -4,6 +4,10 @@ ChainFetcher — windowed BankNifty CE + PE option-chain retrieval.
 Three-phase design:
   Phase 1   searchScrip("NFO", "BANKNIFTY")  → discover CE and PE token maps
             for the configured expiry (token_string → strike_int).
+            If an InstrumentRegistry is supplied at construction, this phase
+            instead reads the token maps from registry.token_map() and makes
+            no searchScrip call at all — see "Registry-sourced discovery"
+            below. Phases 1.5 and 2 are identical either way.
   Phase 1.5 StrikeLadder selects the ±window_steps backbone-strike window
             around ATM = round(spot / step_size) * step_size for CE, then
             derives the matching PE tokens for the same strikes.
@@ -12,6 +16,15 @@ Three-phase design:
             most _BATCH_SIZE tokens.  SmartAPI rejects requests with more than
             50 tokens per exchange per call (error AB4029).  For a 500-pt
             window of ±15 steps: 31 CE + 31 PE = 62 tokens → 2 batches.
+
+Registry-sourced discovery (optional, constructor-injected):
+  Passing registry=<InstrumentRegistry> replaces Phase 1's per-fetch,
+  per-tick searchScrip call with registry.token_map(expiry, "CE"/"PE") —
+  the registry resolves the whole instrument universe once per run instead
+  of once per tick per expiry (see lib/discovery/instrument_registry.py).
+  registry=None (the default) reproduces today's behaviour byte-for-byte;
+  this is the rollback lever, not a feature flag. fetch(smart, spot)'s
+  signature is unchanged in both cases.
 
 Symbol format (confirmed live, 22 Jun 2026):
   searchScrip tradingsymbol : BANKNIFTY26JUN2651000CE
@@ -45,6 +58,8 @@ from lib.logging._factory import get_logger
 
 if TYPE_CHECKING:
     from SmartApi import SmartConnect
+
+    from lib.discovery.instrument_registry import InstrumentRegistry
 
 _NFO = "NFO"
 _BANKNIFTY = "BANKNIFTY"
@@ -107,6 +122,11 @@ class ChainFetcher:
     step_size:
         Backbone grid spacing in index points.  Passed to StrikeLadder.
         Default 500 matches the Phase-1 "liquid 500-pt ladder" contract.
+    registry:
+        Optional InstrumentRegistry. When supplied, Phase 1 reads CE/PE
+        token maps from ``registry.token_map(expiry, side)`` instead of
+        calling searchScrip() — no other behaviour changes. ``None``
+        (default) reproduces today's per-fetch searchScrip path exactly.
 
     Usage::
 
@@ -123,6 +143,7 @@ class ChainFetcher:
         expiry: str,
         window_steps: int = 15,
         step_size: int = 500,
+        registry: InstrumentRegistry | None = None,
     ) -> None:
         self._expiry = expiry
         # SmartAPI symbol names embed a two-digit year: "BANKNIFTY30JUN2643000CE"
@@ -130,6 +151,7 @@ class ChainFetcher:
         self._expiry_2y: str = expiry[:5] + expiry[7:]
         self._window_steps = window_steps
         self._step_size = step_size
+        self._registry = registry
         self._log = get_logger("chain_fetcher")
 
     # ── Properties ──────────────────────────────────────────────────────────────
@@ -153,6 +175,23 @@ class ChainFetcher:
     def step_size(self) -> int:
         """Backbone grid spacing in index points."""
         return self._step_size
+
+    @property
+    def registry(self) -> InstrumentRegistry | None:
+        """The InstrumentRegistry this fetcher reads token maps from, if any."""
+        return self._registry
+
+    @registry.setter
+    def registry(self, value: InstrumentRegistry) -> None:
+        """Attach (or replace) the registry used for Phase 1 token discovery.
+
+        Settable — not just constructor-injected — so a single shared
+        registry can be wired into an already-constructed fetcher (e.g. by
+        DiscoveryController at startup, after the registry itself has been
+        built) without requiring the fetcher's constructor call site to
+        know about the registry in advance.
+        """
+        self._registry = value
 
     # ── Public interface ─────────────────────────────────────────────────────────
 
@@ -183,47 +222,71 @@ class ChainFetcher:
         t0 = _monotonic()
 
         # ── Phase 1: token discovery ───────────────────────────────────────────
-        try:
-            search_result: dict[str, object] = smart.searchScrip(
-                exchange=_NFO, searchscrip=_BANKNIFTY
-            )
-        except Exception as exc:
-            latency_ms = (_monotonic() - t0) * 1000
-            self._log.error(
-                "chain_scrip_search_error",
-                extra={
-                    "latency_ms": round(latency_ms, 2),
-                    "exc_type": type(exc).__name__,
-                    "expiry": self._expiry,
-                },
-            )
-            return self._failure(
-                fetched_at, latency_ms,
-                f"searchScrip raised {type(exc).__name__}",
-                raw_response=None, response_bytes=0,
-            )
+        if self._registry is not None:
+            # Registry-sourced: no searchScrip call. The registry resolved
+            # the instrument universe once for the whole run (see
+            # lib/discovery/instrument_registry.py); this fetch only reads
+            # from it.
+            ce_token_map = self._registry.token_map(self._expiry, _CE)
+            pe_token_map = self._registry.token_map(self._expiry, _PE)
 
-        ce_token_map = self._filter_tokens(search_result, _CE)
-        pe_token_map = self._filter_tokens(search_result, _PE)
+            if not ce_token_map:
+                latency_ms = (_monotonic() - t0) * 1000
+                error = (
+                    f"InstrumentRegistry has no BANKNIFTY CE tokens for "
+                    f"expiry={self._expiry!r} (searched as {self._expiry_2y!r})."
+                )
+                self._log.error(
+                    "chain_no_ce_tokens",
+                    extra={
+                        "expiry": self._expiry,
+                        "expiry_2y": self._expiry_2y,
+                        "source": "registry",
+                    },
+                )
+                return self._failure(fetched_at, latency_ms, error, raw_response=None, response_bytes=0)
+        else:
+            try:
+                search_result: dict[str, object] = smart.searchScrip(
+                    exchange=_NFO, searchscrip=_BANKNIFTY
+                )
+            except Exception as exc:
+                latency_ms = (_monotonic() - t0) * 1000
+                self._log.error(
+                    "chain_scrip_search_error",
+                    extra={
+                        "latency_ms": round(latency_ms, 2),
+                        "exc_type": type(exc).__name__,
+                        "expiry": self._expiry,
+                    },
+                )
+                return self._failure(
+                    fetched_at, latency_ms,
+                    f"searchScrip raised {type(exc).__name__}",
+                    raw_response=None, response_bytes=0,
+                )
 
-        if not ce_token_map:
-            latency_ms = (_monotonic() - t0) * 1000
-            scrip_data = search_result.get("data")
-            scrip_count = len(scrip_data) if isinstance(scrip_data, list) else 0
-            error = (
-                f"No BANKNIFTY CE tokens found for expiry={self._expiry!r} "
-                f"(searched as {self._expiry_2y!r}). "
-                f"searchScrip returned {scrip_count} instruments."
-            )
-            self._log.error(
-                "chain_no_ce_tokens",
-                extra={
-                    "expiry": self._expiry,
-                    "expiry_2y": self._expiry_2y,
-                    "scrip_count": scrip_count,
-                },
-            )
-            return self._failure(fetched_at, latency_ms, error, raw_response=None, response_bytes=0)
+            ce_token_map = self._filter_tokens(search_result, _CE)
+            pe_token_map = self._filter_tokens(search_result, _PE)
+
+            if not ce_token_map:
+                latency_ms = (_monotonic() - t0) * 1000
+                scrip_data = search_result.get("data")
+                scrip_count = len(scrip_data) if isinstance(scrip_data, list) else 0
+                error = (
+                    f"No BANKNIFTY CE tokens found for expiry={self._expiry!r} "
+                    f"(searched as {self._expiry_2y!r}). "
+                    f"searchScrip returned {scrip_count} instruments."
+                )
+                self._log.error(
+                    "chain_no_ce_tokens",
+                    extra={
+                        "expiry": self._expiry,
+                        "expiry_2y": self._expiry_2y,
+                        "scrip_count": scrip_count,
+                    },
+                )
+                return self._failure(fetched_at, latency_ms, error, raw_response=None, response_bytes=0)
 
         # ── Phase 1.5: window selection via StrikeLadder ───────────────────────
         ladder = StrikeLadder(ce_token_map, step_size=self._step_size)

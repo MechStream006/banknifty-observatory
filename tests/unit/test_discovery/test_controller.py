@@ -170,6 +170,9 @@ def _make_controller(
     store: MagicMock | None = None,
     underlying: str = "BANKNIFTY",
     run_id: str | None = None,
+    registry: MagicMock | None = None,
+    validator: MagicMock | None = None,
+    quality_archiver: MagicMock | None = None,
 ) -> DiscoveryController:
     if config is None:
         config = _make_config()
@@ -205,6 +208,9 @@ def _make_controller(
         store=store,
         underlying=underlying,
         run_id=run_id,
+        registry=registry,
+        validator=validator,
+        quality_archiver=quality_archiver,
     )
 
 

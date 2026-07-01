@@ -6,7 +6,7 @@ All data production and persistence is delegated to injected components.
 
 State machine:
     IDLE → STARTING → RUNNING → STOPPING → STOPPED
-    STARTING → ABORTED  (ArchiverError or SessionAcquireError)
+    STARTING → ABORTED  (ArchiverError, SessionAcquireError, or RegistryBuildError)
     RUNNING  → ABORTED  (SessionRefreshError or ArchiverError)
 
 Recoverable within RUNNING (poll continues):
@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 from lib.discovery._errors import (
     ArchiverError,
+    RegistryBuildError,
     SessionAcquireError,
     SessionRefreshError,
     StoreError,
@@ -59,8 +60,10 @@ if TYPE_CHECKING:
     from lib.discovery.fetchers.chain import ChainFetcher
     from lib.discovery.fetchers.spot import SpotFetcher
     from lib.discovery.fetchers.vix import VIXFetcher
+    from lib.discovery.instrument_registry import InstrumentRegistry
     from lib.discovery.scheduler import PollScheduler
     from lib.discovery.session import SmartAPISession
+    from lib.discovery.validation import ValidationEngine, ValidationFinding
 
 # ── State constants ─────────────────────────────────────────────────────────────
 
@@ -109,6 +112,16 @@ class DiscoveryController:
         Constructed but not yet connected SmartAPISession.
     chain_fetchers:
         One ChainFetcher per configured expiry, in expiry_set order.
+    registry:
+        Optional InstrumentRegistry. When supplied, build() is called once
+        during startup — after session.connect() succeeds — and the same
+        instance is then injected into every chain_fetchers entry via its
+        registry setter, replacing each fetcher's own searchScrip() Phase 1
+        with registry-sourced token maps. RegistryBuildError during startup
+        is fatal (STARTING -> ABORTED), matching SessionAcquireError. None
+        (the default) preserves today's behaviour exactly: no build call,
+        no injection — each ChainFetcher keeps whatever registry it was
+        constructed with (None, for all current callers).
     spot_fetcher:
         Constructed SpotFetcher.  Must be called before chain_fetchers each
         tick — the returned spot LTP is the ATM anchor for window selection.
@@ -128,6 +141,21 @@ class DiscoveryController:
         Constructed but not yet opened JSONLArchiver.
     store:
         Optional SQLiteAnalysisStore.  None until store is implemented.
+    validator:
+        Optional ValidationEngine. When supplied, evaluate(record) is called
+        once per tick — before any persistence I/O for that tick — and the
+        resulting findings are (a) best-effort persisted to quality_archiver
+        if supplied, and (b) logged at WARNING/ERROR per finding level (see
+        quality_archiver below). Raw persistence is never gated on the
+        outcome: archiver.write() always runs first, unconditionally,
+        regardless of validation result. None (the default) preserves
+        today's behaviour exactly: no evaluation, no quality stream, no
+        extra logging.
+    quality_archiver:
+        Optional JSONLArchiver, pointed at a separate quality/ directory.
+        Written to only when validator is also supplied. Write failures
+        (ArchiverError) are logged and never abort the run — unlike the
+        raw archiver, whose ArchiverError is fatal.
     """
 
     def __init__(
@@ -145,6 +173,9 @@ class DiscoveryController:
         store: object = None,
         underlying: str = "BANKNIFTY",
         run_id: str | None = None,
+        registry: InstrumentRegistry | None = None,
+        validator: ValidationEngine | None = None,
+        quality_archiver: JSONLArchiver | None = None,
     ) -> None:
         self._config             = config
         self._session            = session
@@ -158,6 +189,9 @@ class DiscoveryController:
         self._archiver           = archiver
         self._store              = store
         self._underlying         = underlying
+        self._registry           = registry
+        self._validator          = validator
+        self._quality_archiver   = quality_archiver
         # Externally supplied run identity. When provided (by the CLI), it is
         # used as the session_id stamped on every record, so a pre-run manifest
         # keyed on the same id stays joinable to this run's records even if the
@@ -237,7 +271,7 @@ class DiscoveryController:
 
             self._state = _STATE_STOPPING
 
-        except (SessionAcquireError, ArchiverError) as exc:
+        except (SessionAcquireError, ArchiverError, RegistryBuildError) as exc:
             abort_reason = f"{type(exc).__name__}: {exc}"
             self._state  = _STATE_ABORTED
             self._log.error(
@@ -321,6 +355,19 @@ class DiscoveryController:
     def _startup(self) -> str:
         self._archiver.open()
         self._session.connect()
+
+        if self._registry is not None:
+            self._registry.build(self._session.smart, self._expiries)
+            for fetcher in self._chain_fetchers:
+                fetcher.registry = self._registry
+            self._log.info(
+                "registry_wired",
+                extra={
+                    "resolved_expiries": len(self._registry.resolved_expiries),
+                    "chain_fetchers": len(self._chain_fetchers),
+                },
+            )
+
         session_id = self._run_id or str(uuid.uuid4())
         self._log.info(
             "phase_started",
@@ -628,15 +675,31 @@ class DiscoveryController:
     # ── Private — persistence ───────────────────────────────────────────────────
 
     def _persist(self, record: ObservationRecord) -> None:
-        """Write the record to JSONL (mandatory) and SQLite store (optional).
+        """Validate (if configured), then write the record to JSONL
+        (mandatory) and SQLite store (optional).
+
+        Ordering (frozen — see docs/PHASE1_FREEZE.md and the L3 Validation
+        Framework design): validation is evaluated first, before any I/O for
+        this tick, but raw persistence is never gated on its outcome —
+        archiver.write() always runs next, unconditionally, exactly as
+        before validation existed. The quality-stream write happens last and
+        is best-effort only.
 
         Raises
         ------
         ArchiverError
-            Propagates from archiver.write() — fatal, aborts the phase.
+            Propagates from archiver.write() (the raw archive) — fatal,
+            aborts the phase. quality_archiver failures never propagate
+            from here; see _persist_quality().
         """
+        findings = self._evaluate_validation(record)
+
         record_dict = dataclasses.asdict(record)
         self._archiver.write(record_dict)
+
+        if findings is not None:
+            self._persist_quality(record, findings)
+            self._log_validation_outcome(record, findings)
 
         if self._store is not None:
             try:
@@ -649,3 +712,84 @@ class DiscoveryController:
                         "poll_id":  record.poll_id,
                     },
                 )
+
+    def _evaluate_validation(
+        self, record: ObservationRecord
+    ) -> list[ValidationFinding] | None:
+        """Run the validator over *record*, if one is configured.
+
+        Returns None when no validator is configured (preserving today's
+        behaviour exactly). ValidationEngine.evaluate() is itself contracted
+        never to raise (a crashing rule becomes a FAIL finding internally),
+        but this is wrapped defensively anyway — the assurance layer must
+        never crash collection, even if that contract were ever violated.
+        """
+        if self._validator is None:
+            return None
+        try:
+            return self._validator.evaluate(record)
+        except Exception as exc:  # noqa: BLE001 — validation must never abort a tick
+            self._log.error(
+                "validation_engine_error",
+                extra={"poll_id": record.poll_id, "exc_type": type(exc).__name__},
+            )
+            return None
+
+    def _persist_quality(
+        self, record: ObservationRecord, findings: list[ValidationFinding]
+    ) -> None:
+        """Best-effort write of *findings* to the quality stream.
+
+        Never raises and never aborts the run: an ArchiverError here (disk
+        full, permission error, etc.) is logged and swallowed, unlike the
+        same exception from the raw archiver, which is fatal. Losing a
+        quality-stream write is not an existential threat the way losing raw
+        observation data is — mirrors the existing best-effort pattern
+        discovery_run.py already uses for manifest writes.
+        """
+        if self._quality_archiver is None:
+            return
+        verdict_dict = {
+            "poll_id": record.poll_id,
+            "session_id": record.session_id,
+            "polled_at": record.polled_at,
+            "ruleset_version": self._validator.ruleset_version if self._validator else None,
+            "findings": [dataclasses.asdict(f) for f in findings],
+        }
+        try:
+            self._quality_archiver.write(verdict_dict)
+        except ArchiverError as exc:
+            self._log.error(
+                "quality_write_failed",
+                extra={"poll_id": record.poll_id, "exc_type": type(exc).__name__},
+            )
+
+    def _log_validation_outcome(
+        self, record: ObservationRecord, findings: list[ValidationFinding]
+    ) -> None:
+        """Log WARN if any WARN findings exist; log ERROR if any FAIL
+        findings exist. These are independent conditions — a record with
+        both a WARN and a FAIL finding logs both lines, so neither is ever
+        silently shadowed by the other.
+        """
+        warn_findings = [f for f in findings if f.level == "WARN"]
+        fail_findings = [f for f in findings if f.level == "FAIL"]
+
+        if warn_findings:
+            self._log.warning(
+                "validation_warn",
+                extra={
+                    "poll_id": record.poll_id,
+                    "warn_count": len(warn_findings),
+                    "rules": [f.rule_id for f in warn_findings],
+                },
+            )
+        if fail_findings:
+            self._log.error(
+                "validation_fail",
+                extra={
+                    "poll_id": record.poll_id,
+                    "fail_count": len(fail_findings),
+                    "rules": [f.rule_id for f in fail_findings],
+                },
+            )

@@ -47,6 +47,16 @@ class ArchiverError(BNODiscoveryError):
     """
 
 
+class RegistryBuildError(BNODiscoveryError):
+    """InstrumentRegistry could not resolve the instrument universe.
+
+    Raised by InstrumentRegistry.build()/rebuild() after the one allowed
+    retry, or immediately when searchScrip returns zero instruments for the
+    configured underlying. Fatal at controller startup — mirrors
+    SessionAcquireError.
+    """
+
+
 class StoreError(BNODiscoveryError):
     """SQLite analysis store encountered an unrecoverable error.
 
