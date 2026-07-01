@@ -24,7 +24,7 @@ def _reset_all_singletons() -> Generator[None, None, None]:
 def minimal_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     env = {
         "BNO_ENV": "development",
-        "BNO_CONFIG_SCHEMA_VERSION": "1",
+        "BNO_CONFIG_SCHEMA_VERSION": "2",
         "BNO_SMARTAPI_API_KEY": "test_api_key_value",
         "BNO_SMARTAPI_CLIENT_ID": "test_client_id",
         "BNO_SMARTAPI_PASSWORD": "test_password_value",
@@ -34,6 +34,7 @@ def minimal_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
         "BNO_TELEGRAM_BOT_TOKEN": "test_telegram_token_value",
         "BNO_TELEGRAM_CHAT_ID": "test_chat_id",
         "BNO_S3_BUCKET": "test-bno-bucket",
+        "BNO_CHAIN_EXPIRIES": "26JUN2026,30JUN2026",
     }
     for key, value in env.items():
         monkeypatch.setenv(key, value)

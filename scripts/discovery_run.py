@@ -38,17 +38,25 @@ from __future__ import annotations
 
 import argparse
 import signal
+import socket
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from lib.config import BNOConfigError, load_settings
-from lib.discovery._errors import PhaseAbortedError
-from lib.discovery._models import PhaseConfig
+from lib.discovery._errors import ArchiverError, PhaseAbortedError
+from lib.discovery._models import (
+    COLLECTION_CONTRACT_VERSION,
+    OBSERVATION_SCHEMA_VERSION,
+    PhaseConfig,
+)
 from lib.discovery.archiver import JSONLArchiver
 from lib.discovery.controller import DiscoveryController
 from lib.discovery.fetchers.chain import ChainFetcher
 from lib.discovery.fetchers.spot import SpotFetcher
 from lib.discovery.fetchers.vix import VIXFetcher
+from lib.discovery.manifest import RunManifest, resolve_git_commit, write_manifest
 from lib.discovery.scheduler import PollScheduler
 from lib.discovery.session import SmartAPISession
 from lib.logging import bootstrap_logging, get_logger
@@ -230,6 +238,64 @@ def main() -> int:  # noqa: C901
         },
     )
 
+    # ── Run identity + manifest scaffolding ─────────────────────────────────────
+    # run_uid is generated here — not inside the controller — so the pre-run
+    # "running" manifest and every record share one session_id. A run killed
+    # before it returns therefore leaves a manifest that is still joinable to
+    # the records it produced, instead of an orphan file.
+    run_uid      = str(uuid.uuid4())
+    started_at   = datetime.now(tz=timezone.utc)
+    manifest_dir = phase_dir / "manifests"
+    git_commit   = resolve_git_commit()
+
+    def _build_manifest(
+        status: str,
+        *,
+        ended_at: datetime | None = None,
+        result: object = None,
+    ) -> RunManifest:
+        return RunManifest(
+            run_id=run_uid,
+            git_commit=git_commit,
+            observation_schema_version=OBSERVATION_SCHEMA_VERSION,
+            config_schema_version=settings.config_schema_version,
+            collection_contract_version=COLLECTION_CONTRACT_VERSION,
+            started_at=started_at,
+            host=socket.gethostname(),
+            expiries=list(expiries),
+            interval_seconds=config.interval_seconds,
+            window_steps=settings.chain_window_steps,
+            step_size=settings.chain_step_size,
+            status=status,
+            ended_at=ended_at,
+            total_ticks=getattr(result, "total_ticks", None),
+            successful_polls=getattr(result, "successful_polls", None),
+            failed_polls=getattr(result, "failed_polls", None),
+        )
+
+    def _write_manifest_safe(
+        status: str,
+        *,
+        ended_at: datetime | None = None,
+        result: object = None,
+    ) -> None:
+        # Best-effort: the observation data is authoritative, so a manifest
+        # write failure is logged but never changes the exit code.
+        try:
+            path = write_manifest(
+                _build_manifest(status, ended_at=ended_at, result=result),
+                manifest_dir,
+            )
+            log.info(
+                "run_manifest_written",
+                extra={"run_id": run_uid, "status": status, "manifest_path": str(path)},
+            )
+        except ArchiverError as exc:
+            log.error(
+                "run_manifest_failed",
+                extra={"run_id": run_uid, "status": status, "exc_type": type(exc).__name__},
+            )
+
     # ── Step 6: Assemble components ─────────────────────────────────────────────
     session      = SmartAPISession(settings)
     chain_fetchers = [
@@ -257,7 +323,11 @@ def main() -> int:  # noqa: C901
         scheduler=scheduler,
         archiver=archiver,
         store=None,  # SQLiteAnalysisStore not yet implemented
+        run_id=run_uid,
     )
+
+    # ── Step 6b: Write the "running" manifest before the poll loop ──────────────
+    _write_manifest_safe("running")
 
     # ── Step 7: Run ─────────────────────────────────────────────────────────────
     try:
@@ -273,6 +343,16 @@ def main() -> int:  # noqa: C901
             file=sys.stderr,
         )
         return 1
+
+    # ── Step 7b: Finalize the manifest (completed / aborted) ────────────────────
+    # Overwrites the "running" manifest with the terminal outcome. A hard kill
+    # before this point leaves the "running" manifest in place as the record
+    # that this run started but did not finish cleanly.
+    _write_manifest_safe(
+        "aborted" if result.ended_early else "completed",
+        ended_at=result.ended_at,
+        result=result,
+    )
 
     # ── Step 8: Report result ───────────────────────────────────────────────────
     log.info(

@@ -40,13 +40,16 @@ from lib.discovery._errors import (
     StoreError,
 )
 from lib.discovery._models import (
+    COLLECTION_CONTRACT_VERSION,
     OBSERVATION_SCHEMA_VERSION,
     ChainResult,
     DerivedObservation,
     ObservationRecord,
     OIChange,
+    OptionQuote,
     PhaseConfig,
     PhaseResult,
+    SnapshotContinuity,
     SnapshotMeta,
 )
 from lib.logging._factory import get_logger
@@ -73,6 +76,16 @@ _STATE_ABORTED  = "aborted"
 _SYMBOL_PREFIX_LEN = 16   # len("BANKNIFTY") + len("DDMMMYY")
 _SIDE_LEN          = 2    # len("CE") or len("PE")
 _SYMBOL_MIN_LEN    = _SYMBOL_PREFIX_LEN + 1 + _SIDE_LEN  # at least 1 strike digit
+
+# Snapshot continuity classification.
+_CONTINUITY_FIRST      = "FIRST"
+_CONTINUITY_CONTIGUOUS = "CONTIGUOUS"
+_CONTINUITY_GAP        = "GAP"
+# A snapshot is CONTIGUOUS when the actual interval since the previous snapshot
+# is within ±50% of the expected poll interval; otherwise it is a GAP. The
+# band absorbs normal scheduler drift while still flagging a missed, delayed,
+# or duplicated poll.
+_CONTINUITY_TOLERANCE  = 0.5
 
 
 # ── Mockable helper ─────────────────────────────────────────────────────────────
@@ -130,6 +143,8 @@ class DiscoveryController:
         scheduler: PollScheduler,
         archiver: JSONLArchiver,
         store: object = None,
+        underlying: str = "BANKNIFTY",
+        run_id: str | None = None,
     ) -> None:
         self._config             = config
         self._session            = session
@@ -142,10 +157,20 @@ class DiscoveryController:
         self._scheduler          = scheduler
         self._archiver           = archiver
         self._store              = store
+        self._underlying         = underlying
+        # Externally supplied run identity. When provided (by the CLI), it is
+        # used as the session_id stamped on every record, so a pre-run manifest
+        # keyed on the same id stays joinable to this run's records even if the
+        # process is killed before run() returns. None → generated at startup.
+        self._run_id             = run_id
         self._log                = get_logger("discovery.controller")
         self._state: str         = _STATE_IDLE
         # Keyed: expiry → {(side, strike): oi}.  None until first successful tick.
         self._prev_oi: dict[str, dict[tuple[str, int], int]] | None = None
+        # Snapshot continuity tracking — identity and timestamp of the previous
+        # persisted snapshot. None until the first snapshot of the run.
+        self._prev_snapshot_id: str | None       = None
+        self._prev_polled_at:   datetime | None   = None
 
     # ── Public interface ────────────────────────────────────────────────────────
 
@@ -296,7 +321,7 @@ class DiscoveryController:
     def _startup(self) -> str:
         self._archiver.open()
         self._session.connect()
-        session_id = str(uuid.uuid4())
+        session_id = self._run_id or str(uuid.uuid4())
         self._log.info(
             "phase_started",
             extra={
@@ -329,6 +354,15 @@ class DiscoveryController:
         smart = self._session.smart
         poll_id = str(uuid.uuid4())
 
+        # ── 0. Continuity ───────────────────────────────────────────────────────
+        # Classify this snapshot against the previous one, then advance the
+        # previous-snapshot cursor. Computed for every snapshot (including
+        # spot-failure snapshots) so the continuity chain is unbroken.
+        continuity = self._compute_continuity(tick_dt)
+        self._prev_snapshot_id = poll_id
+        self._prev_polled_at   = tick_dt
+        is_contiguous = continuity.continuity_status == _CONTINUITY_CONTIGUOUS
+
         # ── 1. Spot ────────────────────────────────────────────────────────────
         spot_result = self._spot_fetcher.fetch(smart)
 
@@ -350,11 +384,15 @@ class DiscoveryController:
                     resolved_atm=0,
                     expiry_set=list(self._expiries),
                     window_steps=self._chain_window_steps,
+                    collection_contract_version=COLLECTION_CONTRACT_VERSION,
+                    chain_step_size=self._chain_step_size,
                 ),
                 spot=spot_result,
                 vix=vix_result,
                 chains=[],
                 derived=None,
+                underlying=self._underlying,
+                continuity=continuity,
             )
 
         spot = spot_result.ltp
@@ -363,6 +401,14 @@ class DiscoveryController:
         # ── 4. Multi-expiry chain fetch ─────────────────────────────────────────
         chain_results = [f.fetch(smart, spot) for f in self._chain_fetchers]
 
+        # ── 4b. Parse immutable instrument identity per chain ───────────────────
+        # Populate expiry + structured quotes on each ChainResult during
+        # collection, so later analysis never re-parses tradingSymbol. The raw
+        # payload on each ChainResult is left untouched.
+        for expiry, chain_result in zip(self._expiries, chain_results):
+            chain_result.expiry = expiry
+            chain_result.quotes = self._parse_quotes(expiry, chain_result)
+
         # ── 5. SnapshotMeta ─────────────────────────────────────────────────────
         meta = SnapshotMeta(
             schema_version=OBSERVATION_SCHEMA_VERSION,
@@ -370,11 +416,15 @@ class DiscoveryController:
             resolved_atm=resolved_atm,
             expiry_set=list(self._expiries),
             window_steps=self._chain_window_steps,
+            collection_contract_version=COLLECTION_CONTRACT_VERSION,
+            chain_step_size=self._chain_step_size,
         )
 
         # ── 6. DerivedObservation ───────────────────────────────────────────────
         if any(c.success for c in chain_results):
-            derived: DerivedObservation | None = self._build_derived(chain_results)
+            derived: DerivedObservation | None = self._build_derived(
+                chain_results, is_contiguous=is_contiguous
+            )
         else:
             derived = None
 
@@ -390,19 +440,126 @@ class DiscoveryController:
             vix=vix_result,
             chains=chain_results,
             derived=derived,
+            underlying=self._underlying,
+            continuity=continuity,
         )
+
+    # ── Private — continuity ─────────────────────────────────────────────────────
+
+    def _compute_continuity(self, tick_dt: datetime) -> SnapshotContinuity:
+        """Classify this snapshot's continuity against the previous snapshot.
+
+        FIRST when there is no predecessor. Otherwise CONTIGUOUS when the actual
+        interval is within ±_CONTINUITY_TOLERANCE of the expected poll interval,
+        else GAP. Uses the persisted ``polled_at`` timestamps so the classification
+        reflects exactly what the archive records.
+        """
+        expected = self._config.interval_seconds
+        prev_id  = self._prev_snapshot_id
+        prev_ts  = self._prev_polled_at
+
+        if prev_id is None or prev_ts is None:
+            return SnapshotContinuity(
+                previous_snapshot_id=None,
+                previous_timestamp=None,
+                expected_interval_seconds=expected,
+                actual_interval_seconds=None,
+                continuity_status=_CONTINUITY_FIRST,
+            )
+
+        actual = (tick_dt - prev_ts).total_seconds()
+        lower  = expected * (1.0 - _CONTINUITY_TOLERANCE)
+        upper  = expected * (1.0 + _CONTINUITY_TOLERANCE)
+        status = (
+            _CONTINUITY_CONTIGUOUS if lower <= actual <= upper else _CONTINUITY_GAP
+        )
+        return SnapshotContinuity(
+            previous_snapshot_id=prev_id,
+            previous_timestamp=prev_ts,
+            expected_interval_seconds=expected,
+            actual_interval_seconds=actual,
+            continuity_status=status,
+        )
+
+    # ── Private — quote parsing ──────────────────────────────────────────────────
+
+    def _parse_quotes(
+        self,
+        expiry: str,
+        chain_result: ChainResult,
+    ) -> list[OptionQuote]:
+        """Parse a chain's raw rows into structured OptionQuote instances.
+
+        Returns an empty list for a failed or empty chain. Rows whose symbol
+        cannot be parsed are skipped (same tolerance as derived computation).
+        The raw payload is read but never mutated.
+        """
+        if not chain_result.success or chain_result.raw_response is None:
+            return []
+        data = chain_result.raw_response.get("data")
+        if not isinstance(data, dict):
+            return []
+        fetched = data.get("fetched")
+        if not isinstance(fetched, list):
+            return []
+
+        quotes: list[OptionQuote] = []
+        for row in fetched:
+            if not isinstance(row, dict):
+                continue
+            raw_sym = row.get("tradingSymbol") or row.get("tradingsymbol") or ""
+            sym = str(raw_sym).upper()
+            if len(sym) < _SYMBOL_MIN_LEN:
+                continue
+            side = sym[-_SIDE_LEN:]
+            if side not in ("CE", "PE"):
+                continue
+            try:
+                strike = int(sym[_SYMBOL_PREFIX_LEN:-_SIDE_LEN])
+            except (ValueError, IndexError):
+                continue
+
+            oi  = int(row.get("opnInterest") or 0)
+            # SmartAPI FULL mode reports traded volume as "tradVol";
+            # fall back to "volume" for synthetic test fixtures.
+            vol = int(row.get("tradVol") or row.get("volume") or 0)
+            raw_ltp = row.get("ltp")
+            ltp = float(raw_ltp) if isinstance(raw_ltp, (int, float)) else None
+
+            quotes.append(
+                OptionQuote(
+                    underlying=self._underlying,
+                    expiry=expiry,
+                    strike=strike,
+                    option_side=side,
+                    oi=oi,
+                    volume=vol,
+                    ltp=ltp,
+                )
+            )
+        return quotes
 
     # ── Private — derived computation ──────────────────────────────────────────
 
     def _build_derived(
         self,
         chain_results: list[ChainResult],
+        is_contiguous: bool,
     ) -> DerivedObservation:
-        """Compute per-tick derived values from raw chain rows.
+        """Compute per-tick derived values from the parsed chain quotes.
 
         Computes per-expiry OI and volume totals, PCR ratios, and inter-tick
         OI deltas.  Updates self._prev_oi for successful expiries so the next
         tick can compute OI changes.
+
+        Consumes the OptionQuote list already parsed onto each ChainResult
+        (never re-parses the raw payload).
+
+        is_contiguous gates the path-dependent OI-delta computation: deltas are
+        produced only when this snapshot is contiguous with the previous one.
+        Across a GAP (or on the first snapshot) oi_changes is None, so a delta
+        never silently spans a missed interval. _prev_oi is still advanced so a
+        subsequent contiguous snapshot resumes correct single-interval deltas.
 
         Called only when at least one ChainResult.success is True.
         """
@@ -415,43 +572,16 @@ class DiscoveryController:
         }
 
         for expiry, chain_result in zip(self._expiries, chain_results):
-            if not chain_result.success or chain_result.raw_response is None:
+            if not chain_result.success:
                 continue
-            data = chain_result.raw_response.get("data")
-            if not isinstance(data, dict):
-                continue
-            fetched = data.get("fetched")
-            if not isinstance(fetched, list):
-                continue
-
-            for row in fetched:
-                if not isinstance(row, dict):
-                    continue
-                raw_sym = row.get("tradingSymbol") or row.get("tradingsymbol") or ""
-                sym = str(raw_sym).upper()
-                if len(sym) < _SYMBOL_MIN_LEN:
-                    continue
-                side = sym[-_SIDE_LEN:]
-                if side not in ("CE", "PE"):
-                    continue
-                try:
-                    strike = int(sym[_SYMBOL_PREFIX_LEN:-_SIDE_LEN])
-                except (ValueError, IndexError):
-                    continue
-
-                oi  = int(row.get("opnInterest") or 0)
-                # SmartAPI FULL mode reports traded volume as "tradVol";
-                # fall back to "volume" for synthetic test fixtures.
-                vol = int(row.get("tradVol") or row.get("volume") or 0)
-
-                current_oi[expiry][(side, strike)] = oi
-
-                if side == "CE":
-                    total_ce_oi[expiry]  += oi
-                    total_ce_vol[expiry] += vol
+            for quote in chain_result.quotes:
+                current_oi[expiry][(quote.option_side, quote.strike)] = quote.oi
+                if quote.option_side == "CE":
+                    total_ce_oi[expiry]  += quote.oi
+                    total_ce_vol[expiry] += quote.volume
                 else:
-                    total_pe_oi[expiry]  += oi
-                    total_pe_vol[expiry] += vol
+                    total_pe_oi[expiry]  += quote.oi
+                    total_pe_vol[expiry] += quote.volume
 
         # OI and volume put-call ratios
         oi_pcr:     dict[str, float | None] = {}
@@ -464,9 +594,9 @@ class DiscoveryController:
             oi_pcr[expiry]     = round(pe_oi  / ce_oi,  4) if ce_oi  > 0 else None
             volume_pcr[expiry] = round(pe_vol / ce_vol, 4) if ce_vol > 0 else None
 
-        # OI changes from previous tick
+        # OI changes from previous tick — only across a contiguous snapshot pair.
         oi_changes: list[OIChange] | None = None
-        if self._prev_oi is not None:
+        if self._prev_oi is not None and is_contiguous:
             oi_changes = []
             for expiry in self._expiries:
                 curr = current_oi[expiry]

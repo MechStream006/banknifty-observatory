@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import lib.discovery.archiver as archiver_mod
 from lib.discovery._errors import ArchiverError
 from lib.discovery.archiver import JSONLArchiver
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 
 # ===========================================================================
@@ -18,7 +21,9 @@ from lib.discovery.archiver import JSONLArchiver
 
 
 def _today_str() -> str:
-    return date.today().strftime("%Y%m%d")
+    # Mirror the archiver's IST trading-day boundary (host-tz independent) so
+    # filename assertions hold on any deployment, not just IST hosts.
+    return datetime.now(tz=timezone.utc).astimezone(_IST).date().strftime("%Y%m%d")
 
 
 def _read_lines(path: Path) -> list[str]:
@@ -259,3 +264,74 @@ class TestDailyRotation:
                 archiver.write({"tick": 2})
         # Total lines across both files
         assert archiver.line_count == 2
+
+
+# ===========================================================================
+# Durability — flush + fsync (Phase-1 freeze patch)
+# ===========================================================================
+
+
+class TestDurability:
+    def test_write_calls_fsync_once_per_record(self, tmp_path: Path) -> None:
+        with patch.object(archiver_mod.os, "fsync") as mock_fsync:
+            with JSONLArchiver(output_dir=tmp_path) as archiver:
+                archiver.write({"tick": 1})
+                archiver.write({"tick": 2})
+        assert mock_fsync.call_count == 2
+
+    def test_fsync_receives_the_open_file_descriptor(self, tmp_path: Path) -> None:
+        with patch.object(archiver_mod.os, "fsync") as mock_fsync:
+            with JSONLArchiver(output_dir=tmp_path) as archiver:
+                archiver.write({"tick": 1})
+                fd = archiver._file.fileno()  # type: ignore[union-attr]
+        mock_fsync.assert_called_once_with(fd)
+
+    def test_fsync_failure_surfaces_as_archiver_error(self, tmp_path: Path) -> None:
+        with patch.object(archiver_mod.os, "fsync", side_effect=OSError("no space")):
+            with JSONLArchiver(output_dir=tmp_path) as archiver:
+                with pytest.raises(ArchiverError):
+                    archiver.write({"tick": 1})
+
+    def test_record_still_written_before_fsync_failure(self, tmp_path: Path) -> None:
+        # write() + flush() happen before fsync; the line is on disk even when
+        # fsync raises. The error is about durability, not content loss.
+        with patch.object(archiver_mod.os, "fsync", side_effect=OSError("no space")):
+            archiver = JSONLArchiver(output_dir=tmp_path)
+            archiver.open()
+            with pytest.raises(ArchiverError):
+                archiver.write({"tick": 1})
+            archiver.close()
+        lines = _read_lines(tmp_path / f"{_today_str()}.jsonl")
+        assert len(lines) == 1
+
+
+# ===========================================================================
+# IST trading-day rotation — deterministic across host timezones
+# ===========================================================================
+
+
+class TestISTRotation:
+    def test_today_is_ist_derived_not_host_local(self) -> None:
+        # 22:00 UTC on 30-Jun is 03:30 IST on 01-Jul — the IST date must win,
+        # regardless of the host OS timezone.
+        fixed_utc = datetime(2026, 6, 30, 22, 0, tzinfo=timezone.utc)
+        with patch.object(archiver_mod, "datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_utc
+            result = archiver_mod._today()
+        assert result == date(2026, 7, 1)
+
+    def test_today_before_ist_midnight_stays_same_day(self) -> None:
+        # 17:00 UTC on 30-Jun is 22:30 IST on 30-Jun — same IST date.
+        fixed_utc = datetime(2026, 6, 30, 17, 0, tzinfo=timezone.utc)
+        with patch.object(archiver_mod, "datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_utc
+            result = archiver_mod._today()
+        assert result == date(2026, 6, 30)
+
+    def test_today_is_deterministic_for_fixed_instant(self) -> None:
+        fixed_utc = datetime(2026, 1, 15, 6, 0, tzinfo=timezone.utc)
+        with patch.object(archiver_mod, "datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_utc
+            first = archiver_mod._today()
+            second = archiver_mod._today()
+        assert first == second == date(2026, 1, 15)

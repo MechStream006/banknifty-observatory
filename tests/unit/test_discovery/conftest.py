@@ -35,7 +35,7 @@ def minimal_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     """Minimum valid BNO_ environment for discovery tests."""
     env: dict[str, str] = {
         "BNO_ENV": "development",
-        "BNO_CONFIG_SCHEMA_VERSION": "1",
+        "BNO_CONFIG_SCHEMA_VERSION": "2",
         "BNO_SMARTAPI_API_KEY": "test_api_key_value",
         "BNO_SMARTAPI_CLIENT_ID": "test_client_id",
         "BNO_SMARTAPI_PASSWORD": "test_password_value",
@@ -45,6 +45,7 @@ def minimal_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
         "BNO_TELEGRAM_BOT_TOKEN": "test_telegram_token_value",
         "BNO_TELEGRAM_CHAT_ID": "-100123456789",
         "BNO_S3_BUCKET": "test-bno-bucket",
+        "BNO_CHAIN_EXPIRIES": "26JUN2026,30JUN2026",
     }
     for key, value in env.items():
         monkeypatch.setenv(key, value)

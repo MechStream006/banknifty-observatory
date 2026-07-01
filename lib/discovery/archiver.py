@@ -5,28 +5,47 @@ Writes one JSON line per record to a dated file::
 
     {output_dir}/{YYYYMMDD}.jsonl
 
-Rotates to a new file automatically on the first write after midnight.
-All write errors propagate as ArchiverError — never swallowed silently,
-so the controller can decide whether to abort the phase.
+The filename date is the IST *trading day*, computed deterministically from
+UTC + a fixed +05:30 offset — never from the host OS timezone. This keeps the
+file→trading-day partitioning identical across deployments regardless of the
+server's local clock. India has no DST, so the fixed offset is exact.
 
-The module-level ``_today`` helper is a thin wrapper around
-``date.today()`` so that tests can patch it for rotation scenarios.
+Each committed record is durably persisted with write() → flush() → os.fsync()
+so an unclean process/host stop cannot lose an acknowledged observation. An
+fsync failure surfaces as ArchiverError, exactly like any other write failure.
+
+All write errors propagate as ArchiverError — never swallowed silently, so the
+controller can decide whether to abort the phase.
+
+The module-level ``_today`` helper returns the current IST date and is kept as
+a mockable seam so tests can patch it for rotation scenarios.
 """
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+import os
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import IO, Any
 
 from lib.discovery._errors import ArchiverError
 
 
+# India Standard Time is a fixed UTC+05:30 offset with no daylight saving.
+# Using a fixed offset (rather than a named zone) makes the trading-day
+# boundary independent of the host OS timezone database.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
 # ── Mockable helper ────────────────────────────────────────────────────────────
 
 
 def _today() -> date:
-    return date.today()
+    """Current IST calendar date, independent of the host OS timezone.
+
+    Deterministic across deployments: derived from UTC + fixed +05:30.
+    """
+    return datetime.now(tz=timezone.utc).astimezone(_IST).date()
 
 
 # ── JSON serialisation ─────────────────────────────────────────────────────────
@@ -166,6 +185,9 @@ class JSONLArchiver:
         try:
             self._file.write(payload)
             self._file.flush()
+            # Durability: force the record to stable storage before returning,
+            # so an unclean process/host stop cannot lose an acknowledged write.
+            os.fsync(self._file.fileno())
         except OSError as exc:
             raise ArchiverError(f"Write failed: {exc}") from exc
 

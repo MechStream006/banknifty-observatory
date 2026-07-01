@@ -10,9 +10,26 @@ Mutable dataclasses: ChainResult, SpotResult, VIXResult, PollRecord,
 SmokeTestResult, PhaseResult, DerivedObservation, ObservationRecord.
 
 OBSERVATION_SCHEMA_VERSION identifies the ObservationRecord JSONL line schema.
-Increment when the ObservationRecord shape changes incompatibly.
   version 2 — Phase-1 observatory contract (current)
   version 3 — reserved for Phase-2 futures addition
+
+COLLECTION_CONTRACT_VERSION identifies *what the collector was configured to
+observe* (underlying, expiries, window, step). It is orthogonal to the schema
+version: schema describes record layout, contract describes observation intent.
+A record can keep the same schema_version while the collection contract changes
+(e.g. a different expiry set) and vice versa.
+
+Schema compatibility policy (enforced by test_schema_policy.py)
+--------------------------------------------------------------
+Within a single OBSERVATION_SCHEMA_VERSION:
+  * Changes are ADDITIVE ONLY. New optional fields (with defaults) may be added
+    without a version bump. Two records sharing a schema_version may therefore
+    carry different key sets — an older record simply lacks the newer keys.
+  * Removing a field, renaming a field, or changing the meaning/units of an
+    existing field REQUIRES an OBSERVATION_SCHEMA_VERSION increment.
+  * READERS MUST TOLERATE UNKNOWN FIELDS. Any consumer of the JSONL archive
+    must ignore keys it does not recognise rather than failing, so that records
+    written by a newer additive schema remain readable by older tooling.
 """
 from __future__ import annotations
 
@@ -22,10 +39,17 @@ from pathlib import Path
 from typing import Final
 
 
-# Increment when ObservationRecord fields change incompatibly.
+# Increment when ObservationRecord fields change incompatibly (see the schema
+# compatibility policy in the module docstring). Additive fields do NOT bump it.
 # Phase-1 observatory contract: version 2.
 # Phase-2 futures: bump to 3 and populate futures_result.
 OBSERVATION_SCHEMA_VERSION: Final[int] = 2
+
+# Identifies what the collector was configured to observe. Bump when the
+# observation intent changes in a way analysis must distinguish (e.g. a change
+# to how the ATM window or step grid is defined). Independent of the schema
+# version — see the module docstring.
+COLLECTION_CONTRACT_VERSION: Final[int] = 1
 
 
 @dataclass(frozen=True)
@@ -65,6 +89,28 @@ class SessionToken:
     user_profile: dict[str, object]
 
 
+@dataclass(frozen=True)
+class OptionQuote:
+    """One parsed option contract observation within a chain snapshot.
+
+    Immutable instrument identity plus its point-in-time metrics, extracted
+    from the raw chain row during collection so that later analysis never has
+    to re-parse ``tradingSymbol``. The raw payload is preserved unchanged on
+    the parent ChainResult; this is a structured, additive projection of it.
+
+    underlying / expiry / strike / option_side fully identify the instrument.
+    ltp is best-effort (None when the raw row carried no last-traded price).
+    """
+
+    underlying: str
+    expiry: str
+    strike: int
+    option_side: str  # "CE" or "PE"
+    oi: int
+    volume: int
+    ltp: float | None
+
+
 @dataclass
 class ChainResult:
     """Result of one BankNifty option chain API call.
@@ -72,6 +118,11 @@ class ChainResult:
     Always returned by ChainFetcher.fetch() — never raised. On API failure,
     success=False and error carries a sanitised description (no secrets).
     raw_response is None on failure; the full parsed JSON dict on success.
+
+    expiry and quotes are populated by the controller after fetch (additive,
+    Phase-1 freeze patch). raw_response is never modified. quotes is the
+    parsed instrument-identity projection of the raw rows; expiry is the
+    configured expiry this chain was fetched for.
     """
 
     fetched_at: datetime
@@ -84,6 +135,8 @@ class ChainResult:
     unfetched_count: int
     error: str | None
     success: bool
+    expiry: str = ""
+    quotes: list[OptionQuote] = field(default_factory=list)
 
 
 @dataclass
@@ -138,6 +191,11 @@ class SnapshotMeta:
     Note: expiry_set is a mutable list stored inside a frozen dataclass.
     The frozen constraint prevents reassignment of the attribute, not
     mutation of the list itself. Callers must not mutate expiry_set.
+
+    collection_contract_version and chain_step_size are additive provenance
+    fields (Phase-1 freeze patch). chain_step_size makes the requested strike
+    grid (resolved_atm ± i·chain_step_size for i in 0..window_steps) fully
+    reconstructable from the record alone, without external config.
     """
 
     schema_version: int
@@ -145,6 +203,34 @@ class SnapshotMeta:
     resolved_atm: int
     expiry_set: list[str]
     window_steps: int
+    collection_contract_version: int = COLLECTION_CONTRACT_VERSION
+    chain_step_size: int = 0
+
+
+@dataclass(frozen=True)
+class SnapshotContinuity:
+    """Snapshot-level continuity metadata linking this snapshot to the prior one.
+
+    Lets any consumer decide whether two consecutive persisted snapshots are
+    contiguous (exactly one poll interval apart) without assuming the archive
+    has no gaps. Derived path-dependent metrics (e.g. OI deltas) are computed
+    only across CONTIGUOUS snapshots; across a GAP they are withheld rather
+    than silently spanning the gap.
+
+    continuity_status:
+        "FIRST"      — first snapshot of the run; no predecessor.
+        "CONTIGUOUS" — actual interval within tolerance of the expected interval.
+        "GAP"        — actual interval outside tolerance (a poll was missed,
+                       delayed, or duplicated); path-dependent derivations are
+                       not valid across this boundary.
+    actual_interval_seconds is None only when continuity_status is "FIRST".
+    """
+
+    previous_snapshot_id: str | None
+    previous_timestamp: datetime | None
+    expected_interval_seconds: int
+    actual_interval_seconds: float | None
+    continuity_status: str
 
 
 @dataclass(frozen=True)
@@ -212,6 +298,15 @@ class ObservationRecord:
     be read or populated by Phase-1 code. Its presence as a typed slot ensures
     that Phase-2 can populate it without an ObservationRecord schema change
     beyond a schema_version increment.
+
+    underlying names the instrument this record observes (Phase-1: "BANKNIFTY").
+    It is stored explicitly so the corpus is self-describing and multi-symbol
+    ready without a schema break. The per-contract underlying is also carried
+    on every OptionQuote.
+
+    continuity carries snapshot-level linkage to the previous snapshot. It is
+    always populated by the controller for persisted records; the default of
+    None applies only to ad-hoc constructions in tests.
     """
 
     poll_id: str
@@ -226,6 +321,8 @@ class ObservationRecord:
     chains: list[ChainResult]
     derived: DerivedObservation | None = field(default=None)
     futures_result: dict[str, object] | None = field(default=None)
+    underlying: str = "BANKNIFTY"
+    continuity: SnapshotContinuity | None = field(default=None)
 
 
 @dataclass

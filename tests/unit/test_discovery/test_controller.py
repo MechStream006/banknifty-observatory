@@ -168,6 +168,8 @@ def _make_controller(
     scheduler: _SchedulerStub | None = None,
     archiver: MagicMock | None = None,
     store: MagicMock | None = None,
+    underlying: str = "BANKNIFTY",
+    run_id: str | None = None,
 ) -> DiscoveryController:
     if config is None:
         config = _make_config()
@@ -201,6 +203,8 @@ def _make_controller(
         scheduler=scheduler,
         archiver=archiver,
         store=store,
+        underlying=underlying,
+        run_id=run_id,
     )
 
 
