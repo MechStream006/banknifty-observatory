@@ -567,9 +567,17 @@ class DiscoveryController:
                 continue
 
             oi  = int(row.get("opnInterest") or 0)
-            # SmartAPI FULL mode reports traded volume as "tradVol";
-            # fall back to "volume" for synthetic test fixtures.
-            vol = int(row.get("tradVol") or row.get("volume") or 0)
+            # SmartAPI FULL mode reports traded volume as "tradeVolume"
+            # (mirrors the "opnInterest" field above), verified against the live
+            # NFO option payload. The earlier "tradVol" primary matched no real
+            # row, so volume_pcr was always null; it is retained only as a
+            # fallback alongside "volume" for legacy synthetic fixtures.
+            vol = int(
+                row.get("tradeVolume")
+                or row.get("tradVol")
+                or row.get("volume")
+                or 0
+            )
             raw_ltp = row.get("ltp")
             ltp = float(raw_ltp) if isinstance(raw_ltp, (int, float)) else None
 

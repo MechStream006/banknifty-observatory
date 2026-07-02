@@ -54,12 +54,15 @@ def _sym(strike: int, side: str) -> str:
 
 
 def _row(strike: int, side: str, oi: int, vol: int = 0) -> dict:
+    # "tradeVolume" is the real SmartAPI FULL-mode field name (matches the live
+    # NFO payload). Do not revert to "tradVol"/"volume" — those matched no real
+    # row and masked the production null-volume_pcr bug.
     return {
         "tradingSymbol": _sym(strike, side),
         "expiryDate": _EXPIRY,
         "ltp": 100.0,
         "opnInterest": oi,
-        "tradVol": vol,
+        "tradeVolume": vol,
     }
 
 
@@ -1133,6 +1136,49 @@ class TestDerivedObservation:
         record = store.insert.call_args[0][0]
         assert record.derived is not None
         assert record.derived.oi_pcr[_EXPIRY] == 0.8  # 800 / 1000
+
+    def test_volume_pcr_computed_correctly(self) -> None:
+        store = MagicMock()
+        rows = [
+            _row(58000, "CE", oi=1000, vol=400),
+            _row(58000, "PE", oi=800,  vol=600),
+        ]
+        cf = MagicMock()
+        cf.fetch.return_value = _make_chain_result_with_rows(rows)
+        ctrl = _make_controller(
+            chain_fetchers=[cf], expiries=[_EXPIRY], store=store,
+            scheduler=_SchedulerStub(_DT_1),
+        )
+        ctrl.run()
+        record = store.insert.call_args[0][0]
+        assert record.derived is not None
+        assert record.derived.volume_pcr[_EXPIRY] == 1.5  # 600 / 400
+
+    def test_volume_read_from_live_tradeVolume_field(self) -> None:
+        """Locks the real SmartAPI field name.
+
+        Builds rows with the literal "tradeVolume" key exactly as the live NFO
+        FULL-mode payload delivers it — deliberately NOT via the _row helper —
+        so this fails if the parser stops reading "tradeVolume". This is the
+        regression guard for the production null-volume_pcr incident.
+        """
+        store = MagicMock()
+        rows = [
+            {"tradingSymbol": _sym(58000, "CE"), "expiryDate": _EXPIRY,
+             "ltp": 100.0, "opnInterest": 1000, "tradeVolume": 12150},
+            {"tradingSymbol": _sym(58000, "PE"), "expiryDate": _EXPIRY,
+             "ltp": 100.0, "opnInterest": 800, "tradeVolume": 24300},
+        ]
+        cf = MagicMock()
+        cf.fetch.return_value = _make_chain_result_with_rows(rows)
+        ctrl = _make_controller(
+            chain_fetchers=[cf], expiries=[_EXPIRY], store=store,
+            scheduler=_SchedulerStub(_DT_1),
+        )
+        ctrl.run()
+        record = store.insert.call_args[0][0]
+        assert record.derived is not None
+        assert record.derived.volume_pcr[_EXPIRY] == 2.0  # 24300 / 12150
 
     def test_volume_pcr_none_when_ce_volume_zero(self) -> None:
         store = MagicMock()
